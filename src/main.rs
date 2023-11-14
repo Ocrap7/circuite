@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     fmt::{Debug, Display},
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 mod element;
@@ -18,62 +18,37 @@ enum State {
     Invalid,
 }
 
-use cacao::appkit::{toolbar::Toolbar, window::WindowToolbarStyle};
 use element::{Element, ElementManager};
 use messages::Message;
-use objc::{msg_send, runtime::Object, sel, sel_impl};
-use objc_id::ShareId;
-use platform::toolbars::PreferencesToolbar;
 use render::RenderManager;
-use vello::kurbo::{Rect, Affine};
 use winit::{
+    dpi::LogicalSize,
     event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
-    platform::macos::{WindowBuilderExtMacOS, WindowExtMacOS},
-    window::WindowBuilder, dpi::LogicalSize,
+    window::WindowBuilder,
 };
 use State::*;
 
+use crate::element::EventContext;
+
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     let event_loop = EventLoopBuilder::<Message>::with_user_event().build();
 
     // cacao::appkit::App::new(bundle_id, delegate).
 
+    // window.set
+
     let window = WindowBuilder::new()
-        .with_title("Node Fiddler")
+        .with_title("Node Fiddler 0")
         .with_inner_size(LogicalSize::new(800, 772))
         .with_resizable(true)
         .build(&event_loop)
         .unwrap();
 
-    // window.ns_window();
-
     let mut sim = Arc::new(Simulator::new());
     let mut elements = Vec::new();
-
-    let tb = Toolbar::new("PreferencesToolbar", PreferencesToolbar::default());
-    tb.set_display_mode(cacao::appkit::toolbar::ToolbarDisplayMode::IconAndLabel);
-
-    let win = unsafe {
-        cacao::appkit::window::Window::<()> {
-            objc: ShareId::from_ptr(window.ns_window() as *mut Object),
-            delegate: None,
-        }
-    };
-    win.set_title_visibility(cacao::appkit::window::TitleVisibility::Hidden);
-    win.set_toolbar(&tb);
-    // win.styl
-    unsafe {
-        // sel_impl!()
-        let _: () = msg_send![&*(window.ns_window() as *mut Object), setToolbarStyle:WindowToolbarStyle::Unified];
-    }
-
-    let trans = Affine::translate((-50.0, -50.0)).then_scale(2.0).then_translate((50.0, 50.0).into());
-    println!("{:?}", trans.transform_rect_bbox(Rect::from_origin_size((0.0, 0.0), (100.0, 100.0))).center());
-
-    // let proxy = event_loop.create_proxy();
-    // let _ = platform::start_toolbar(window.ns_window(), Mutex::new(proxy).into());
 
     {
         let sim = Arc::get_mut(&mut sim).unwrap();
@@ -81,63 +56,99 @@ async fn main() {
         let in2 = sim.insert_component(Component::Input(Low));
 
         let and_index = sim.insert_component(Component::XorGate);
-        let output_index = sim.insert_component(Component::Output(Low));
+        let custom_index = sim.insert_component(Component::Custom(16));
 
-        elements.push(Element {
-            component: ComponentHandle(in1),
-            position: (100.0, 100.0).into(),
-        });
+        let outputs = (0..16)
+            .map(|_| sim.insert_component(Component::Output(Low)))
+            .collect::<Vec<_>>();
 
-        elements.push(Element {
-            component: ComponentHandle(in2),
-            position: (100.0, 400.0).into(),
-        });
+        elements.push(Element::new(ComponentHandle(in1), (100.0, 100.0).into()));
 
-        elements.push(Element {
-            component: ComponentHandle(and_index),
-            position: (300.0, 250.0).into(),
-        });
+        elements.push(Element::new(ComponentHandle(in2), (100.0, 400.0).into()));
 
-        elements.push(Element {
-            component: ComponentHandle(output_index),
-            position: (500.0, 250.0).into(),
-        });
+        elements.push(Element::new(
+            ComponentHandle(and_index),
+            (300.0, 250.0).into(),
+        ));
+
+        elements.push(
+            Element::new(ComponentHandle(custom_index), (500.0, 250.0).into())
+                .with_size((100.0, 200.0)),
+        );
 
         sim.connect(RegisteredPin(in1, 0), RegisteredPin(and_index, 0));
         sim.connect(RegisteredPin(in2, 0), RegisteredPin(and_index, 1));
-        sim.connect(RegisteredPin(and_index, 2), RegisteredPin(output_index, 0));
+        // sim.connect(RegisteredPin(and_index, 2), RegisteredPin(output_index, 0));
+
+        outputs.into_iter().enumerate().for_each(|out| {
+            elements.push(Element::new(
+                ComponentHandle(out.1),
+                (
+                    700.0,
+                    250.0 - 16.0 / 2.0 * (100.0 + 20.0) + out.0 as f64 * 120.0,
+                )
+                    .into(),
+            ));
+
+            sim.connect(RegisteredPin(custom_index, out.0), RegisteredPin(out.1, 0))
+        });
 
         sim.tick();
     }
 
-    let element_manager = ElementManager::new(sim.clone()).with_elements(elements);
+    let mut egui_state = egui_winit::State::new(&window);
+    let egui_context = egui::Context::default();
+    egui_extras::install_image_loaders(&egui_context);
+
+    let element_manager = ElementManager::new(
+        sim.clone(),
+        (
+            window.inner_size().width as f64,
+            window.inner_size().height as f64,
+        ),
+    )
+    .with_elements(elements);
 
     let mut render_manager = RenderManager::new(&window, element_manager).await;
 
-    event_loop.run(move |event, _, cf| match event {
-        Event::LoopDestroyed => *cf = ControlFlow::Exit,
-        Event::WindowEvent { event, .. } => {
-            render_manager.element_manager.event(&event);
+    event_loop.run(move |event, _, cf| {
+        match event {
+            Event::LoopDestroyed => *cf = ControlFlow::Exit,
+            Event::WindowEvent { event, .. } => {
+                egui_state.on_event(&egui_context, &event);
 
-            match &event {
-                WindowEvent::CloseRequested => *cf = ControlFlow::Exit,
-                WindowEvent::KeyboardInput {
-                    input:
-                        KeyboardInput {
-                            state: ElementState::Pressed,
-                            virtual_keycode: Some(VirtualKeyCode::Escape),
-                            ..
+                render_manager.element_manager.event(
+                    &EventContext {
+                        set_cursor_icon: &|icon| {
+                            window.set_cursor_icon(icon);
                         },
-                    ..
-                } => *cf = ControlFlow::Exit,
-                WindowEvent::Resized(size) => render_manager.resize(size.width, size.height),
-                _ => (),
+                    },
+                    &event,
+                );
+
+                match &event {
+                    WindowEvent::CloseRequested => *cf = ControlFlow::Exit,
+                    WindowEvent::KeyboardInput {
+                        input:
+                            KeyboardInput {
+                                state: ElementState::Pressed,
+                                virtual_keycode: Some(VirtualKeyCode::Escape),
+                                ..
+                            },
+                        ..
+                    } => *cf = ControlFlow::Exit,
+                    WindowEvent::Resized(size) => render_manager.resize(size.width, size.height),
+                    _ => (),
+                }
+                window.request_redraw()
             }
-            window.request_redraw()
-        }
-        // Event::MainEventsCleared => window.request_redraw(),
-        Event::RedrawRequested(_) => render_manager.draw(),
-        _ => (),
+            Event::RedrawRequested(_) => {
+                render_manager.draw();
+                render_manager.update_gui(&mut egui_state, &egui_context, &window);
+                render_manager.present();
+            }
+            _ => (),
+        };
     });
 }
 
@@ -171,6 +182,7 @@ enum Component {
     AndGate,
     XorGate,
     NotGate,
+    Custom(usize),
 }
 
 impl Component {
@@ -183,6 +195,7 @@ impl Component {
             Component::AndGate => 2,
             Component::XorGate => 2,
             Component::NotGate => 1,
+            Component::Custom(_) => 0,
         }
     }
 
@@ -195,6 +208,7 @@ impl Component {
             Component::AndGate => 1,
             Component::XorGate => 1,
             Component::NotGate => 1,
+            Component::Custom(i) => *i,
         }
     }
 
@@ -235,6 +249,7 @@ impl Component {
             Component::AndGate => "and gate",
             Component::XorGate => "xor gate",
             Component::NotGate => "not gate",
+            Component::Custom(_) => "custom",
         }
     }
 
@@ -407,6 +422,7 @@ impl Component {
                     [Low] => High,
                 }
             }
+            Component::Custom(_) => Low,
         }
     }
 }
